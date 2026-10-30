@@ -9,14 +9,27 @@ after price first returned to a level.
 
 Data
 ----
-The app uses Binance's public Spot klines endpoint:
-https://data-api.binance.vision/api/v3/klines
+The app tries public candle providers in this order:
+1. Binance Spot BTC/USDT host fallback chain (`data-api.binance.vision`, `api.binance.com`,
+   `api-gcp.binance.com`, and `api1` through `api4.binance.com`).
+2. Coinbase Exchange public BTC-USD candles.
+3. Kraken public BTC/USD OHLC.
 
-Binance documents this market-data-only host as not requiring an API key:
+Binance market-data-only documentation:
 https://github.com/binance/binance-spot-api-docs/blob/master/faqs/market_data_only.md
+Coinbase candles documentation:
+https://api.exchange.coinbase.com/products/BTC-USD/candles
+Kraken OHLC documentation:
+https://docs.kraken.com/api/docs/rest-api/get-ohlc-data/
 
-This is a public endpoint, not a promise of uninterrupted availability. The app
+No API key is needed. The app displays which provider succeeded and the quote
+currency. Coinbase/Kraken fallback data is BTC/USD, not BTC/USDT, so the currency
+is labelled honestly and prices may differ slightly between exchanges. The app
 does not connect to an account, request credentials, or place orders.
+
+The app can auto-refresh every 30 seconds. It shows the in-progress candle on
+the chart as provisional, but excludes that candle from the historical calculations
+until the candle interval has closed. A manual refresh button is also available.
 
 Important provisional assumptions
 ---------------------------------
@@ -50,7 +63,7 @@ Safety and limitations
 ----------------------
 - Historical study only; no buy/sell recommendations or order execution.
 - Does not include fees, slippage, funding, or realistic fill simulation.
-- A current, unfinished candle is excluded.
+- A current, unfinished candle is shown as provisional but excluded from calculations.
 - A successful HTTP response does not independently authenticate the quality of
   a market-data provider.
 - Do not add account or trading credentials to this project.

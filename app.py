@@ -6,8 +6,19 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
-BASE_URL = "https://data-api.binance.vision/api/v3/klines"
+BINANCE_BASES = [
+    "https://data-api.binance.vision",
+    "https://api.binance.com",
+    "https://api-gcp.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api4.binance.com",
+]
+COINBASE_CANDLES = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+KRAKEN_OHLC = "https://api.kraken.com/0/public/OHLC"
 COLUMNS = [
     "open_time", "open", "high", "low", "close", "volume",
     "close_time", "quote_volume", "trades", "taker_buy_base",
@@ -15,7 +26,7 @@ COLUMNS = [
 ]
 
 st.set_page_config(page_title="BTC Momentum-Level Study", layout="wide")
-st.title("BTC/USDT Momentum-Level Historical Study")
+st.title("BTC Momentum-Level Historical Study")
 st.caption("Educational research only • No orders • No trade recommendations • Public historical market data")
 
 with st.sidebar:
@@ -28,43 +39,127 @@ with st.sidebar:
     close_edge_pct = st.slider("Strong close near candle edge (%)", 50, 95, 70, 5)
     min_spacing_atr = st.slider("Custom nearby-level filter: min spacing (ATR)", 0.25, 5.0, 1.0, 0.25)
     forward_bars = st.slider("Bars to observe after event", 3, 24, 6)
-    refresh = st.button("Fetch fresh data", type="primary")
+    auto_refresh = st.checkbox("Auto-refresh every 30 seconds", value=True)
+    refresh = st.button("Fetch fresh data now", type="primary")
+    if auto_refresh:
+        st_autorefresh(interval=30_000, key="btc_market_auto_refresh")
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_klines(interval: str, limit: int) -> pd.DataFrame:
-    response = requests.get(
-        BASE_URL,
-        params={"symbol": "BTCUSDT", "interval": interval, "limit": limit},
-        timeout=15,
-        headers={"User-Agent": "BTC-Momentum-Level-Study/1.0"},
-    )
-    response.raise_for_status()
-    raw = response.json()
-    if not isinstance(raw, list) or not raw:
-        raise ValueError("The data provider returned an empty or unexpected response.")
-    df = pd.DataFrame(raw, columns=COLUMNS)
+@st.cache_data(ttl=20, show_spinner=False)
+def fetch_klines(interval: str, limit: int):
+    """Try public providers in order; normalize candles to one common schema."""
+    errors = []
+    headers = {"User-Agent": "BTC-Momentum-Level-Study/1.1", "Accept": "application/json"}
+
+    # 1) Binance public Spot API host chain (same BTC/USDT market).
+    for base in BINANCE_BASES:
+        try:
+            response = requests.get(
+                f"{base}/api/v3/klines",
+                params={"symbol": "BTCUSDT", "interval": interval, "limit": limit},
+                timeout=8, headers=headers,
+            )
+            response.raise_for_status()
+            raw = response.json()
+            if not isinstance(raw, list) or not raw:
+                raise ValueError("empty or unexpected response")
+            df = pd.DataFrame(raw, columns=COLUMNS)
+            for col in ["open", "high", "low", "close", "volume", "quote_volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+            df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+            df = _clean_candles(df)
+            if len(df) >= 50:
+                return df, f"Binance Spot ({base})", "USDT", errors
+            raise ValueError(f"only {len(df)} usable candles")
+        except Exception as exc:
+            errors.append(f"Binance {base}: {type(exc).__name__}: {exc}")
+
+    # 2) Coinbase public BTC-USD candles. This is a different quote market (USD),
+    # and its REST endpoint returns at most 300 candles per request.
+    try:
+        seconds = {"5m": 300, "15m": 900, "1h": 3600}[interval]
+        response = requests.get(
+            COINBASE_CANDLES, params={"granularity": seconds},
+            timeout=10, headers=headers,
+        )
+        response.raise_for_status()
+        raw = response.json()
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("empty or unexpected response")
+        # Coinbase order: [time, low, high, open, close, volume], newest first.
+        cb = pd.DataFrame(raw, columns=["epoch", "low", "high", "open", "close", "volume"])
+        cb["open_time"] = pd.to_datetime(pd.to_numeric(cb["epoch"]), unit="s", utc=True)
+        cb["close_time"] = cb["open_time"] + pd.to_timedelta(seconds - 1, unit="s")
+        cb["quote_volume"] = np.nan
+        cb["trades"] = np.nan
+        cb["taker_buy_base"] = np.nan
+        cb["taker_buy_quote"] = np.nan
+        cb["ignore"] = np.nan
+        for col in ["open", "high", "low", "close", "volume"]:
+            cb[col] = pd.to_numeric(cb[col], errors="coerce")
+        cb = _clean_candles(cb[COLUMNS])
+        if len(cb) >= 50:
+            return cb.tail(limit).reset_index(drop=True), "Coinbase Exchange", "USD", errors
+        raise ValueError(f"only {len(cb)} usable candles")
+    except Exception as exc:
+        errors.append(f"Coinbase: {type(exc).__name__}: {exc}")
+
+    # 3) Kraken public OHLC. Also BTC/USD, so never silently label it USDT.
+    try:
+        response = requests.get(
+            KRAKEN_OHLC, params={"pair": "XBTUSD", "interval": {"5m": 5, "15m": 15, "1h": 60}[interval]},
+            timeout=10, headers=headers,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("error"):
+            raise ValueError("; ".join(payload["error"]))
+        result = payload.get("result", {})
+        pair_key = next((k for k in result if k != "last"), None)
+        raw = result.get(pair_key, []) if pair_key else []
+        if not raw:
+            raise ValueError("empty or unexpected response")
+        # Kraken order: [time, open, high, low, close, vwap, volume, count].
+        kr = pd.DataFrame(raw, columns=["epoch", "open", "high", "low", "close", "vwap", "volume", "trades"])
+        kr["open_time"] = pd.to_datetime(pd.to_numeric(kr["epoch"]), unit="s", utc=True)
+        kr["close_time"] = kr["open_time"] + pd.to_timedelta({"5m": 5, "15m": 15, "1h": 60}[interval] * 60 - 1, unit="s")
+        kr["quote_volume"] = np.nan
+        kr["taker_buy_base"] = np.nan
+        kr["taker_buy_quote"] = np.nan
+        kr["ignore"] = np.nan
+        for col in ["open", "high", "low", "close", "volume"]:
+            kr[col] = pd.to_numeric(kr[col], errors="coerce")
+        kr = _clean_candles(kr[COLUMNS])
+        if len(kr) >= 50:
+            return kr.tail(limit).reset_index(drop=True), "Kraken Spot", "USD", errors
+        raise ValueError(f"only {len(kr)} usable candles")
+    except Exception as exc:
+        errors.append(f"Kraken: {type(exc).__name__}: {exc}")
+
+    raise RuntimeError("All public candle providers failed. Details: " + " | ".join(errors[-10:]))
+
+def _clean_candles(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     for col in ["open", "high", "low", "close", "volume", "quote_volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    df = df.dropna(subset=["open", "high", "low", "close", "volume"])
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["open_time", "open", "high", "low", "close", "volume"])
     df = df.sort_values("open_time").drop_duplicates("open_time").reset_index(drop=True)
-    if len(df) < 50:
-        raise ValueError("Too few candles returned for a meaningful study.")
     return df
 
 if refresh:
     fetch_klines.clear()
 
 try:
-    with st.spinner("Loading public BTC/USDT historical candles…"):
-        df = fetch_klines(interval, bars)
+    with st.spinner("Loading public BTC candles with API fallback…"):
+        df, data_source, quote_currency, provider_errors = fetch_klines(interval, bars)
 except Exception as exc:
     st.error(f"Could not load public data: {exc}")
-    st.info("Check your internet connection and try again. No fallback data is silently substituted.")
+    st.info("Check your connection. The app tried several public candle endpoints and displays the failure details above.")
     st.stop()
 
-# Explicitly flag the current, potentially unfinished candle.
+# Keep the in-progress candle visible on the chart, but exclude it from calculations.
+chart_df = df.copy()
 now = pd.Timestamp.now(tz="UTC")
 last_open = df["open_time"].iloc[-1]
 interval_minutes = {"5m": 5, "15m": 15, "1h": 60}[interval]
@@ -203,16 +298,30 @@ events_df = pd.DataFrame(events)
 latest = df.iloc[-1]
 m1, m2, m3 = st.columns(3)
 m1.metric("Last closed candle (UTC)", latest["open_time"].strftime("%Y-%m-%d %H:%M"))
-m2.metric("Last close (USDT)", f'{latest["close"]:,.2f}')
+m2.metric(f"Last closed candle close ({quote_currency})", f'{latest["close"]:,.2f}')
 m3.metric("Candidate momentum levels", f"{len(levels)}")
 
 if last_candle_may_be_open:
-    st.info("The newest candle was still forming and has been excluded. Only closed candles are analysed.")
+    live = chart_df.iloc[-1]
+    st.info(
+        f"A candle is currently forming (shown on the chart but excluded from calculations). "
+        f"Open time: {live['open_time'].strftime('%Y-%m-%d %H:%M:%S UTC')} • "
+        f"Open {live['open']:,.2f} / High {live['high']:,.2f} / "
+        f"Low {live['low']:,.2f} / Latest close {live['close']:,.2f} {quote_currency}. "
+        "The displayed close is provisional until the interval ends."
+    )
+
+st.caption(f"Active data source: {data_source} • Quote currency: {quote_currency} • Auto-refresh: {'on (30s)' if auto_refresh else 'off'}")
+if provider_errors:
+    with st.expander("API fallback diagnostics"):
+        st.caption("Earlier endpoints in the fallback chain failed; the successful provider is shown above.")
+        for item in provider_errors:
+            st.text(item)
 
 st.subheader("Historical price and candidate momentum-origin levels")
 fig = go.Figure(data=[go.Candlestick(
-    x=df["open_time"], open=df["open"], high=df["high"],
-    low=df["low"], close=df["close"], name="BTC/USDT"
+    x=chart_df["open_time"], open=chart_df["open"], high=chart_df["high"],
+    low=chart_df["low"], close=chart_df["close"], name=f"BTC/{quote_currency}"
 )])
 for n, level in enumerate(levels):
     fig.add_hline(
@@ -231,7 +340,7 @@ if not events_df.empty:
         ))
 fig.update_layout(
     height=650, xaxis_rangeslider_visible=False,
-    xaxis_title="Time (UTC)", yaxis_title="Price (USDT)",
+    xaxis_title="Time (UTC)", yaxis_title=f"Price ({quote_currency})",
     legend_orientation="h"
 )
 st.plotly_chart(fig, use_container_width=True)
@@ -272,4 +381,4 @@ st.warning(
     "or prove an edge. Fees, slippage, funding, survivorship/selection effects, and "
     "out-of-sample validation are not included. Public endpoint availability and terms may change."
 )
-st.caption("Data source: Binance public Spot market-data endpoint. No API key is required for this public endpoint.")
+st.caption("Public market-data only; no API key is required. Fallbacks may switch from BTC/USDT to BTC/USD, which is clearly labelled because exchange prices and quote currencies can differ.")
