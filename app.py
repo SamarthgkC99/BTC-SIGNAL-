@@ -39,6 +39,7 @@ with st.sidebar:
     close_edge_pct = st.slider("Strong close near candle edge (%)", 50, 95, 70, 5)
     min_spacing_atr = st.slider("Custom nearby-level filter: min spacing (ATR)", 0.25, 5.0, 1.0, 0.25)
     forward_bars = st.slider("Bars to observe after event", 3, 24, 6)
+    cooldown_bars = st.slider("Cooldown bars before same level can fire again", 1, 12, 3)
     auto_refresh = st.checkbox("Auto-refresh every 30 seconds", value=True)
     refresh = st.button("Fetch fresh data now", type="primary")
     if auto_refresh:
@@ -212,15 +213,24 @@ for candidate in raw_levels:
                          for level in levels):
         levels.append(candidate)
 
-# For each level, count later touches and study candle behaviour.
+# For each level, record later touches and study candle behaviour. A level stays
+# active until price strongly closes beyond it, and it can fire again after a
+# cooldown, so its story can flip with the market instead of freezing on the
+# first touch.
 events = []
 for level_no, level in enumerate(levels, start=1):
     li = level["index"]
     lvl = level["price"]
+    level_invalid = False
+    last_event_i = -10**9
     for i in range(li + 1, len(df)):
         row = df.iloc[i]
         atr = row["atr"]
         if pd.isna(atr):
+            continue
+        if level_invalid:
+            break
+        if i <= last_event_i + cooldown_bars:
             continue
         # A touch means the candle range intersects the level.
         if row["low"] <= lvl <= row["high"]:
@@ -259,16 +269,17 @@ for level_no, level in enumerate(levels, start=1):
             else:
                 label = "Touch / no defined pattern"
 
-            end_i = min(i + forward_bars, len(df) - 1)
-            future = df.iloc[i + 1:end_i + 1]
-            if len(future):
+            future = df.iloc[i + 1:i + 1 + forward_bars]
+            if len(future) == forward_bars:
                 # Descriptive forward movement only, not a trade return.
+                # Only full horizons are measured, so trailing events are not
+                # averaged in as if they covered the complete window.
                 forward_close_change_pct = (
                     (float(future["close"].iloc[-1]) / float(row["close"])) - 1
                 ) * 100
                 future_high_excursion_pct = (
                     (float(future["high"].max()) / float(row["close"])) - 1
-                ) * 100
+                )  * 100
                 future_low_excursion_pct = (
                     (float(future["low"].min()) / float(row["close"])) - 1
                 ) * 100
@@ -288,10 +299,16 @@ for level_no, level in enumerate(levels, start=1):
                 "forward_close_change_pct": forward_close_change_pct,
                 "future_high_excursion_pct": future_high_excursion_pct,
                 "future_low_excursion_pct": future_low_excursion_pct,
+                "level_invalidated": False,
             })
-            # Avoid counting consecutive bars at the same level as repeated independent events.
-            # Continue scanning after a short cooldown.
-            break
+            last_event_i = i
+            if label.startswith("Strong close"):
+                # A strong close beyond the level invalidates it: the level
+                # stops producing events and is marked on the chart.
+                level_invalid = True
+                level["invalidated"] = True
+                events[-1]["level_invalidated"] = True
+                break
 
 events_df = pd.DataFrame(events)
 
@@ -324,9 +341,10 @@ fig = go.Figure(data=[go.Candlestick(
     low=chart_df["low"], close=chart_df["close"], name=f"BTC/{quote_currency}"
 )])
 for n, level in enumerate(levels):
+    invalidated = bool(level.get("invalidated"))
     fig.add_hline(
-        y=level["price"], line_dash="dot", opacity=0.45,
-        annotation_text=f"L{n+1} {level['direction']}",
+        y=level["price"], line_dash="dot", opacity=0.25 if invalidated else 0.45,
+        annotation_text=f"L{n+1} {level['direction']}" + (" • invalidated" if invalidated else ""),
         annotation_position="right"
     )
 if not events_df.empty:
@@ -343,7 +361,7 @@ fig.update_layout(
     xaxis_title="Time (UTC)", yaxis_title=f"Price ({quote_currency})",
     legend_orientation="h"
 )
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width="stretch")
 
 st.subheader("Method definition used in this prototype")
 st.markdown("""
@@ -352,14 +370,16 @@ st.markdown("""
 - **Nearby-level filter:** keep a candidate only when it is at least the selected ATR distance from existing levels.
 - **Rejection candle:** lower/upper wick relative to body, candle direction, and close location meet the selected thresholds.
 - **Breakout candidate:** candle crosses the level, closes beyond it, has a large body relative to ATR, and closes near the candle edge.
-- **Evaluation:** after the first later touch of each level, measure subsequent price excursions over the chosen number of bars. These are descriptive measurements, not simulated profit or validated trade results.
+- **Repeated events:** after an event, a level rests for the selected cooldown bars and can then fire again, so a level can later show the opposite signal (for example a bearish rejection followed by a strong bullish close above it).
+- **Level invalidation:** once price strongly closes beyond a level, the level stops producing events and its chart label is marked invalidated.
+- **Evaluation:** after each touch, measure subsequent price excursions over the chosen number of bars — only complete horizons are measured. These are descriptive measurements, not simulated profit or validated trade results.
 """)
 
 st.subheader("Historical event study")
 if events_df.empty:
     st.warning("No level-touch events met the current definitions in this sample. Try a wider level-spacing filter or a lower impulse threshold for research.")
 else:
-    st.dataframe(events_df, use_container_width=True, hide_index=True)
+    st.dataframe(events_df, width="stretch", hide_index=True)
     st.download_button(
         "Download event-study CSV",
         data=events_df.to_csv(index=False).encode("utf-8"),
@@ -374,7 +394,7 @@ else:
         avg_future_high_excursion_pct=("future_high_excursion_pct", "mean"),
         avg_future_low_excursion_pct=("future_low_excursion_pct", "mean"),
     ).reset_index()
-    st.dataframe(summary.round(4), use_container_width=True, hide_index=True)
+    st.dataframe(summary.round(4), width="stretch", hide_index=True)
 
 st.warning(
     "Research prototype only. It does not generate buy/sell instructions, place orders, "

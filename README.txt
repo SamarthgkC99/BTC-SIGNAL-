@@ -39,11 +39,28 @@ Important provisional assumptions
 4. Rejection candles use configurable wick/body and close-location conditions.
 5. Breakout candidates require a strong body, a close beyond the level, and a
    close near the candle edge.
-6. After a level's first later touch, the app records forward price movement over
-   a chosen horizon. This is not a trading return and does not prove profitability.
+6. After each touch, the app records forward price movement over a chosen horizon.
+   This is not a trading return and does not prove profitability.
 
 These definitions are starting assumptions because "origin of a momentum move"
 and the user's custom nearby-level filter still need exact definitions.
+
+Behaviour of levels over time
+-----------------------------
+A level is not frozen after its first touch:
+
+- The same level can fire repeated events. After an event the level rests for
+  the selected cooldown bars, then continues to be watched.
+- A level is invalidated once price strongly closes beyond it. Invalidated
+  levels stop producing events and their chart label is marked invalidated, so
+  a bearish-origin level that is broken upward stops dominating the study.
+- Forward movement is only measured when the full horizon of bars exists, so
+  events near the newest candles are not mixed in as if they covered the whole
+  window.
+
+Earlier versions scanned each level only until its first touch (a permanent
+break), which made the first observed pattern stick permanently even after the
+market flipped. That behaviour is fixed.
 
 Run on Windows 11
 -----------------
