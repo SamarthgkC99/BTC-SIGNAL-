@@ -1,404 +1,512 @@
-import time
-from datetime import datetime, timezone
+import hmac
+import os
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-BINANCE_BASES = [
-    "https://data-api.binance.vision",
-    "https://api.binance.com",
-    "https://api-gcp.binance.com",
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-    "https://api4.binance.com",
-]
-COINBASE_CANDLES = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
-KRAKEN_OHLC = "https://api.kraken.com/0/public/OHLC"
-COLUMNS = [
-    "open_time", "open", "high", "low", "close", "volume",
-    "close_time", "quote_volume", "trades", "taker_buy_base",
-    "taker_buy_quote", "ignore"
-]
+import engine
+import providers
+import signals
+import store as storemod
+from signals import IST, INTERVAL_MIN, SIDE_LABEL, Params, in_trade_window
 
-st.set_page_config(page_title="BTC Momentum-Level Study", layout="wide")
-st.title("BTC Momentum-Level Historical Study")
-st.caption("Educational research only • No orders • No trade recommendations • Public historical market data")
+st.set_page_config(page_title="BTC Momentum-Level Study", layout="wide", initial_sidebar_state="auto")
+st.markdown("""
+<style>
+@media (max-width: 640px) {
+  .block-container {padding: 0.8rem 0.6rem 3rem 0.6rem;}
+  h1 {font-size: 1.45rem !important;}
+  [data-testid="stMetricValue"] {font-size: 1.2rem;}
+  [data-testid="stMetricLabel"] {font-size: 0.8rem;}
+}
+</style>""", unsafe_allow_html=True)
 
+STORE = storemod.Store()
+
+
+# ---------------------------------------------------------------- login gate
+def gate():
+    pw = os.environ.get("APP_PASSWORD")
+    if not pw:
+        st.warning("No APP_PASSWORD is set: anyone with this page's URL can open it. "
+                   "Set APP_PASSWORD in your host's environment variables.")
+        return
+    if st.session_state.get("authed"):
+        return
+    st.title("BTC Momentum-Level Study")
+    entered = st.text_input("Password", type="password")
+    if entered and hmac.compare_digest(entered.encode(), pw.encode()):
+        st.session_state["authed"] = True
+        st.rerun()
+    elif entered:
+        st.error("Wrong password.")
+    st.stop()
+
+
+gate()
+
+
+# ---------------------------------------------------------------- helpers
+@st.cache_data(ttl=15, show_spinner=False)
+def read_key(key):
+    try:
+        return STORE.read(key), None
+    except Exception as exc:                                    # noqa: BLE001
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def fetch_klines(interval: str, limit: int, provider: str, fallback: bool):
+    return providers.fetch_candles(interval, limit, allow_usd=True, provider=provider, fallback=fallback)
+
+
+def set_settings(**changes):
+    """Merge changes into the saved settings (used by the quick buttons)."""
+    current = engine.merge_settings(STORE.read("settings"))
+    current.update(changes)
+    STORE.write("settings", current)
+    read_key.clear()
+
+
+def ist_str(series):
+    return series.dt.tz_convert(IST).dt.strftime("%Y-%m-%d %H:%M")
+
+
+def ist_naive(series):
+    return series.dt.tz_convert(IST).dt.tz_localize(None)
+
+
+def next_window_start(now_utc):
+    t = now_utc.tz_convert(IST)
+    for d in range(0, 9):
+        cand = (t + pd.Timedelta(days=d)).normalize() + pd.Timedelta(hours=19)
+        if cand.weekday() in (1, 2, 3) and cand > t:
+            return cand
+    return None
+
+
+def show_df(df, compact_cols=None, compact=False):
+    st.dataframe(df, width="stretch", hide_index=True)       # all columns always shown (scroll sideways)
+
+
+S = engine.merge_settings(read_key("settings")[0])
+
+# ---------------------------------------------------------------- sidebar
+IVS = ["5m", "15m", "1h"]
 with st.sidebar:
     st.header("Study settings")
-    interval = st.selectbox("Candle timeframe", ["5m", "15m", "1h"], index=0)
-    bars = st.slider("Historical candles", min_value=200, max_value=1000, value=500, step=100)
-    atr_period = st.slider("ATR period", 5, 50, 14)
-    impulse_atr = st.slider("Impulse body ≥ ATR ×", 0.5, 3.0, 1.2, 0.1)
-    wick_body_ratio = st.slider("Rejection wick/body ratio ≥", 1.0, 4.0, 1.5, 0.1)
-    close_edge_pct = st.slider("Strong close near candle edge (%)", 50, 95, 70, 5)
-    min_spacing_atr = st.slider("Custom nearby-level filter: min spacing (ATR)", 0.25, 5.0, 1.0, 0.25)
-    forward_bars = st.slider("Bars to observe after event", 3, 24, 6)
-    cooldown_bars = st.slider("Cooldown bars before same level can fire again", 1, 12, 3)
+    compact = st.checkbox("Mobile / compact layout", value=False)
+    RULES = ["Legacy (first version)", "Improved (fixes)"]
+    if "cooldown_bars" not in st.session_state:
+        st.session_state["cooldown_bars"] = int(S["cooldown_bars"])
+
+    def _rules_changed():                      # switching rules also switches the cooldown to that version's default
+        st.session_state["cooldown_bars"] = 3 if st.session_state["rules_mode"].startswith("Legacy") else 6
+
+    rules_mode = st.selectbox("Event rules", RULES, index=RULES.index(S["rules_mode"]) if S["rules_mode"] in RULES else 0,
+                              key="rules_mode", on_change=_rules_changed)
+    legacy = rules_mode.startswith("Legacy")
+    interval = st.selectbox("Candle timeframe", IVS, index=IVS.index(S["interval"]))
+    bars = st.slider("Historical candles", 200, 1000, int(S["bars"]), 100)
+    atr_period = st.slider("ATR period", 5, 50, int(S["atr_period"]))
+    impulse_atr = st.slider("Impulse body ≥ ATR ×", 0.5, 3.0, float(S["impulse_atr"]), 0.1)
+    wick_body_ratio = st.slider("Rejection wick/body ratio ≥", 1.0, 4.0, float(S["wick_body_ratio"]), 0.1)
+    close_edge_pct = st.slider("Strong close near candle edge (%)", 50, 95, int(S["close_edge_pct"]), 5)
+    min_spacing_atr = st.slider("Custom nearby-level filter: min spacing (ATR)", 0.25, 5.0,
+                                float(S["min_spacing_atr"]), 0.25)
+    forward_bars = st.slider("Bars to observe after event", 3, 24, int(S["forward_bars"]))
+    cooldown_bars = st.slider("Cooldown bars before same level can fire again", 1, 12, key="cooldown_bars")
+    confirm_closes = st.slider("Closes beyond a level that invalidate it (Improved rules only)", 2, 8,
+                               int(S["confirm_closes"]), disabled=legacy)
+    st.divider()
+    study_values = {}
+    pch = providers.PROVIDER_CHOICES
+    provider = st.selectbox("Price provider", pch, index=pch.index(S["provider"]) if S["provider"] in pch else 0)
+    provider_fallback = st.checkbox("If it fails, fall back to the other providers",
+                                    value=bool(S["provider_fallback"]))
+    study_values = dict(interval=interval, bars=bars, atr_period=atr_period, impulse_atr=impulse_atr,
+                        wick_body_ratio=wick_body_ratio, close_edge_pct=close_edge_pct,
+                        min_spacing_atr=min_spacing_atr, forward_bars=forward_bars, cooldown_bars=cooldown_bars,
+                        confirm_closes=confirm_closes, provider=provider, provider_fallback=provider_fallback,
+                        rules_mode=rules_mode)
+    if st.button("Apply these study settings + provider to the trader"):
+        try:
+            set_settings(**study_values)
+            st.success("Saved: the trader uses these settings from its next cycle.")
+        except Exception as exc:                                # noqa: BLE001
+            st.error(f"Could not save: {type(exc).__name__}")
+    st.divider()
     auto_refresh = st.checkbox("Auto-refresh every 30 seconds", value=True)
     refresh = st.button("Fetch fresh data now", type="primary")
     if auto_refresh:
         st_autorefresh(interval=30_000, key="btc_market_auto_refresh")
 
-@st.cache_data(ttl=20, show_spinner=False)
-def fetch_klines(interval: str, limit: int):
-    """Try public providers in order; normalize candles to one common schema."""
-    errors = []
-    headers = {"User-Agent": "BTC-Momentum-Level-Study/1.1", "Accept": "application/json"}
+params = Params(atr_period=atr_period, impulse_atr=impulse_atr, wick_body_ratio=wick_body_ratio,
+                close_edge_pct=close_edge_pct, min_spacing_atr=min_spacing_atr, forward_bars=forward_bars,
+                cooldown_bars=cooldown_bars, confirm_closes=confirm_closes, legacy=legacy)
 
-    # 1) Binance public Spot API host chain (same BTC/USDT market).
-    for base in BINANCE_BASES:
-        try:
-            response = requests.get(
-                f"{base}/api/v3/klines",
-                params={"symbol": "BTCUSDT", "interval": interval, "limit": limit},
-                timeout=8, headers=headers,
-            )
-            response.raise_for_status()
-            raw = response.json()
-            if not isinstance(raw, list) or not raw:
-                raise ValueError("empty or unexpected response")
-            df = pd.DataFrame(raw, columns=COLUMNS)
-            for col in ["open", "high", "low", "close", "volume", "quote_volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-            df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-            df = _clean_candles(df)
-            if len(df) >= 50:
-                return df, f"Binance Spot ({base})", "USDT", errors
-            raise ValueError(f"only {len(df)} usable candles")
-        except Exception as exc:
-            errors.append(f"Binance {base}: {type(exc).__name__}: {exc}")
-
-    # 2) Coinbase public BTC-USD candles. This is a different quote market (USD),
-    # and its REST endpoint returns at most 300 candles per request.
-    try:
-        seconds = {"5m": 300, "15m": 900, "1h": 3600}[interval]
-        response = requests.get(
-            COINBASE_CANDLES, params={"granularity": seconds},
-            timeout=10, headers=headers,
-        )
-        response.raise_for_status()
-        raw = response.json()
-        if not isinstance(raw, list) or not raw:
-            raise ValueError("empty or unexpected response")
-        # Coinbase order: [time, low, high, open, close, volume], newest first.
-        cb = pd.DataFrame(raw, columns=["epoch", "low", "high", "open", "close", "volume"])
-        cb["open_time"] = pd.to_datetime(pd.to_numeric(cb["epoch"]), unit="s", utc=True)
-        cb["close_time"] = cb["open_time"] + pd.to_timedelta(seconds - 1, unit="s")
-        cb["quote_volume"] = np.nan
-        cb["trades"] = np.nan
-        cb["taker_buy_base"] = np.nan
-        cb["taker_buy_quote"] = np.nan
-        cb["ignore"] = np.nan
-        for col in ["open", "high", "low", "close", "volume"]:
-            cb[col] = pd.to_numeric(cb[col], errors="coerce")
-        cb = _clean_candles(cb[COLUMNS])
-        if len(cb) >= 50:
-            return cb.tail(limit).reset_index(drop=True), "Coinbase Exchange", "USD", errors
-        raise ValueError(f"only {len(cb)} usable candles")
-    except Exception as exc:
-        errors.append(f"Coinbase: {type(exc).__name__}: {exc}")
-
-    # 3) Kraken public OHLC. Also BTC/USD, so never silently label it USDT.
-    try:
-        response = requests.get(
-            KRAKEN_OHLC, params={"pair": "XBTUSD", "interval": {"5m": 5, "15m": 15, "1h": 60}[interval]},
-            timeout=10, headers=headers,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("error"):
-            raise ValueError("; ".join(payload["error"]))
-        result = payload.get("result", {})
-        pair_key = next((k for k in result if k != "last"), None)
-        raw = result.get(pair_key, []) if pair_key else []
-        if not raw:
-            raise ValueError("empty or unexpected response")
-        # Kraken order: [time, open, high, low, close, vwap, volume, count].
-        kr = pd.DataFrame(raw, columns=["epoch", "open", "high", "low", "close", "vwap", "volume", "trades"])
-        kr["open_time"] = pd.to_datetime(pd.to_numeric(kr["epoch"]), unit="s", utc=True)
-        kr["close_time"] = kr["open_time"] + pd.to_timedelta({"5m": 5, "15m": 15, "1h": 60}[interval] * 60 - 1, unit="s")
-        kr["quote_volume"] = np.nan
-        kr["taker_buy_base"] = np.nan
-        kr["taker_buy_quote"] = np.nan
-        kr["ignore"] = np.nan
-        for col in ["open", "high", "low", "close", "volume"]:
-            kr[col] = pd.to_numeric(kr[col], errors="coerce")
-        kr = _clean_candles(kr[COLUMNS])
-        if len(kr) >= 50:
-            return kr.tail(limit).reset_index(drop=True), "Kraken Spot", "USD", errors
-        raise ValueError(f"only {len(kr)} usable candles")
-    except Exception as exc:
-        errors.append(f"Kraken: {type(exc).__name__}: {exc}")
-
-    raise RuntimeError("All public candle providers failed. Details: " + " | ".join(errors[-10:]))
-
-def _clean_candles(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    for col in ["open", "high", "low", "close", "volume", "quote_volume"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["open_time", "open", "high", "low", "close", "volume"])
-    df = df.sort_values("open_time").drop_duplicates("open_time").reset_index(drop=True)
-    return df
-
+# ---------------------------------------------------------------- data + signals
 if refresh:
     fetch_klines.clear()
+    read_key.clear()
 
+data_ok, fetch_error = True, None
 try:
     with st.spinner("Loading public BTC candles with API fallback…"):
-        df, data_source, quote_currency, provider_errors = fetch_klines(interval, bars)
-except Exception as exc:
-    st.error(f"Could not load public data: {exc}")
-    st.info("Check your connection. The app tried several public candle endpoints and displays the failure details above.")
-    st.stop()
+        df, data_source, quote_currency, provider_errors = fetch_klines(interval, bars, provider, provider_fallback)
+except Exception as exc:                                        # noqa: BLE001
+    data_ok, fetch_error = False, str(exc)
 
-# Keep the in-progress candle visible on the chart, but exclude it from calculations.
-chart_df = df.copy()
-now = pd.Timestamp.now(tz="UTC")
-last_open = df["open_time"].iloc[-1]
-interval_minutes = {"5m": 5, "15m": 15, "1h": 60}[interval]
-last_candle_may_be_open = now < last_open + pd.Timedelta(minutes=interval_minutes)
-if last_candle_may_be_open:
-    df = df.iloc[:-1].copy().reset_index(drop=True)
+if data_ok:
+    chart_df = df.copy()
+    closed, forming = signals.closed_only(df, interval)
+    if len(closed) < 50:
+        data_ok, fetch_error = False, "Not enough fully closed candles after excluding the current candle."
 
-if len(df) < 50:
-    st.warning("Not enough fully closed candles after excluding the current candle.")
-    st.stop()
-
-# Volatility and candle measurements.
-prev_close = df["close"].shift(1)
-tr = pd.concat([
-    df["high"] - df["low"],
-    (df["high"] - prev_close).abs(),
-    (df["low"] - prev_close).abs()
-], axis=1).max(axis=1)
-df["atr"] = tr.rolling(atr_period, min_periods=atr_period).mean()
-df["body"] = (df["close"] - df["open"]).abs()
-df["range"] = (df["high"] - df["low"]).replace(0, np.nan)
-df["body_frac"] = df["body"] / df["range"]
-df["close_position"] = (df["close"] - df["low"]) / df["range"]
-df["upper_wick"] = df["high"] - df[["open", "close"]].max(axis=1)
-df["lower_wick"] = df[["open", "close"]].min(axis=1) - df["low"]
-
-# Provisional operational definition of an impulse:
-# candle body is large relative to ATR. "Origin" is approximated as the candle open.
-df["impulse"] = df["atr"].notna() & (df["body"] >= impulse_atr * df["atr"])
-df["direction"] = np.where(df["close"] > df["open"], "Bullish",
-                    np.where(df["close"] < df["open"], "Bearish", "Neutral"))
-
-# Candidate momentum-origin levels, with configurable distance filter.
-raw_levels = []
-for i, row in df.iterrows():
-    if bool(row["impulse"]) and pd.notna(row["atr"]):
-        raw_levels.append({
-            "index": int(i),
-            "time": row["open_time"],
-            "price": float(row["open"]),
-            "direction": row["direction"],
-            "atr": float(row["atr"]),
-            "body": float(row["body"]),
-        })
-
-levels = []
-for candidate in raw_levels:
-    min_distance = min_spacing_atr * candidate["atr"]
-    if not levels or all(abs(candidate["price"] - level["price"]) >= min_distance
-                         for level in levels):
-        levels.append(candidate)
-
-# For each level, record later touches and study candle behaviour. A level stays
-# active until price strongly closes beyond it, and it can fire again after a
-# cooldown, so its story can flip with the market instead of freezing on the
-# first touch.
-events = []
-for level_no, level in enumerate(levels, start=1):
-    li = level["index"]
-    lvl = level["price"]
-    level_invalid = False
-    last_event_i = -10**9
-    for i in range(li + 1, len(df)):
-        row = df.iloc[i]
-        atr = row["atr"]
-        if pd.isna(atr):
-            continue
-        if level_invalid:
-            break
-        if i <= last_event_i + cooldown_bars:
-            continue
-        # A touch means the candle range intersects the level.
-        if row["low"] <= lvl <= row["high"]:
-            body = max(float(row["body"]), 1e-12)
-            bullish_rejection = (
-                row["lower_wick"] / body >= wick_body_ratio
-                and row["close"] > row["open"]
-                and row["close_position"] >= 0.5
-            )
-            bearish_rejection = (
-                row["upper_wick"] / body >= wick_body_ratio
-                and row["close"] < row["open"]
-                and row["close_position"] <= 0.5
-            )
-            edge = close_edge_pct / 100.0
-            strong_bull_break = (
-                row["close"] > lvl
-                and row["open"] < lvl
-                and row["body"] >= impulse_atr * atr
-                and row["close_position"] >= edge
-            )
-            strong_bear_break = (
-                row["close"] < lvl
-                and row["open"] > lvl
-                and row["body"] >= impulse_atr * atr
-                and row["close_position"] <= (1 - edge)
-            )
-            if bullish_rejection:
-                label = "Bullish rejection (candidate)"
-            elif bearish_rejection:
-                label = "Bearish rejection (candidate)"
-            elif strong_bull_break:
-                label = "Strong close above level (candidate)"
-            elif strong_bear_break:
-                label = "Strong close below level (candidate)"
-            else:
-                label = "Touch / no defined pattern"
-
-            future = df.iloc[i + 1:i + 1 + forward_bars]
-            if len(future) == forward_bars:
-                # Descriptive forward movement only, not a trade return.
-                # Only full horizons are measured, so trailing events are not
-                # averaged in as if they covered the complete window.
-                forward_close_change_pct = (
-                    (float(future["close"].iloc[-1]) / float(row["close"])) - 1
-                ) * 100
-                future_high_excursion_pct = (
-                    (float(future["high"].max()) / float(row["close"])) - 1
-                )  * 100
-                future_low_excursion_pct = (
-                    (float(future["low"].min()) / float(row["close"])) - 1
-                ) * 100
-            else:
-                forward_close_change_pct = np.nan
-                future_high_excursion_pct = np.nan
-                future_low_excursion_pct = np.nan
-
-            events.append({
-                "level_id": level_no,
-                "level_time": level["time"],
-                "level_price": lvl,
-                "origin_direction": level["direction"],
-                "event_time": row["open_time"],
-                "event_price": float(row["close"]),
-                "pattern": label,
-                "forward_close_change_pct": forward_close_change_pct,
-                "future_high_excursion_pct": future_high_excursion_pct,
-                "future_low_excursion_pct": future_low_excursion_pct,
-                "level_invalidated": False,
-            })
-            last_event_i = i
-            if label.startswith("Strong close"):
-                # A strong close beyond the level invalidates it: the level
-                # stops producing events and is marked on the chart.
-                level_invalid = True
-                level["invalidated"] = True
-                events[-1]["level_invalidated"] = True
-                break
-
-events_df = pd.DataFrame(events)
-
-latest = df.iloc[-1]
-m1, m2, m3 = st.columns(3)
-m1.metric("Last closed candle (UTC)", latest["open_time"].strftime("%Y-%m-%d %H:%M"))
-m2.metric(f"Last closed candle close ({quote_currency})", f'{latest["close"]:,.2f}')
-m3.metric("Candidate momentum levels", f"{len(levels)}")
-
-if last_candle_may_be_open:
-    live = chart_df.iloc[-1]
-    st.info(
-        f"A candle is currently forming (shown on the chart but excluded from calculations). "
-        f"Open time: {live['open_time'].strftime('%Y-%m-%d %H:%M:%S UTC')} • "
-        f"Open {live['open']:,.2f} / High {live['high']:,.2f} / "
-        f"Low {live['low']:,.2f} / Latest close {live['close']:,.2f} {quote_currency}. "
-        "The displayed close is provisional until the interval ends."
-    )
-
-st.caption(f"Active data source: {data_source} • Quote currency: {quote_currency} • Auto-refresh: {'on (30s)' if auto_refresh else 'off'}")
-if provider_errors:
-    with st.expander("API fallback diagnostics"):
-        st.caption("Earlier endpoints in the fallback chain failed; the successful provider is shown above.")
-        for item in provider_errors:
-            st.text(item)
-
-st.subheader("Historical price and candidate momentum-origin levels")
-fig = go.Figure(data=[go.Candlestick(
-    x=chart_df["open_time"], open=chart_df["open"], high=chart_df["high"],
-    low=chart_df["low"], close=chart_df["close"], name=f"BTC/{quote_currency}"
-)])
-for n, level in enumerate(levels):
-    invalidated = bool(level.get("invalidated"))
-    fig.add_hline(
-        y=level["price"], line_dash="dot", opacity=0.25 if invalidated else 0.45,
-        annotation_text=f"L{n+1} {level['direction']}" + (" • invalidated" if invalidated else ""),
-        annotation_position="right"
-    )
-if not events_df.empty:
-    for _, ev in events_df.iterrows():
-        fig.add_trace(go.Scatter(
-            x=[ev["event_time"]], y=[ev["event_price"]],
-            mode="markers", marker={"size": 8},
-            name=ev["pattern"], hovertemplate=(
-                "%{x}<br>Price: %{y:.2f}<br>" + ev["pattern"] + "<extra></extra>"
-            )
-        ))
-fig.update_layout(
-    height=650, xaxis_rangeslider_visible=False,
-    xaxis_title="Time (UTC)", yaxis_title=f"Price ({quote_currency})",
-    legend_orientation="h"
-)
-st.plotly_chart(fig, width="stretch")
-
-st.subheader("Method definition used in this prototype")
-st.markdown("""
-- **Impulse candle:** body size is at least the selected multiple of ATR.
-- **Momentum origin:** approximated as the impulse candle's open. This is a placeholder definition, not yet confirmed as your intended origin.
-- **Nearby-level filter:** keep a candidate only when it is at least the selected ATR distance from existing levels.
-- **Rejection candle:** lower/upper wick relative to body, candle direction, and close location meet the selected thresholds.
-- **Breakout candidate:** candle crosses the level, closes beyond it, has a large body relative to ATR, and closes near the candle edge.
-- **Repeated events:** after an event, a level rests for the selected cooldown bars and can then fire again, so a level can later show the opposite signal (for example a bearish rejection followed by a strong bullish close above it).
-- **Level invalidation:** once price strongly closes beyond a level, the level stops producing events and its chart label is marked invalidated.
-- **Evaluation:** after each touch, measure subsequent price excursions over the chosen number of bars — only complete horizons are measured. These are descriptive measurements, not simulated profit or validated trade results.
-""")
-
-st.subheader("Historical event study")
-if events_df.empty:
-    st.warning("No level-touch events met the current definitions in this sample. Try a wider level-spacing filter or a lower impulse threshold for research.")
+if data_ok:
+    dfi, levels, events = signals.run_study(closed, params, interval)
+    live_price = float(chart_df["close"].iloc[-1])
 else:
-    st.dataframe(events_df, width="stretch", hide_index=True)
-    st.download_button(
-        "Download event-study CSV",
-        data=events_df.to_csv(index=False).encode("utf-8"),
-        file_name="btc_momentum_level_events.csv",
-        mime="text/csv"
-    )
-    st.subheader("Descriptive outcomes by observed pattern")
-    summary = events_df.groupby("pattern", dropna=False).agg(
-        events=("pattern", "count"),
-        avg_forward_close_change_pct=("forward_close_change_pct", "mean"),
-        median_forward_close_change_pct=("forward_close_change_pct", "median"),
-        avg_future_high_excursion_pct=("future_high_excursion_pct", "mean"),
-        avg_future_low_excursion_pct=("future_low_excursion_pct", "mean"),
-    ).reset_index()
-    st.dataframe(summary.round(4), width="stretch", hide_index=True)
+    events, levels, live_price = pd.DataFrame(), [], None
 
-st.warning(
-    "Research prototype only. It does not generate buy/sell instructions, place orders, "
-    "or prove an edge. Fees, slippage, funding, survivorship/selection effects, and "
-    "out-of-sample validation are not included. Public endpoint availability and terms may change."
-)
-st.caption("Public market-data only; no API key is required. Fallbacks may switch from BTC/USDT to BTC/USD, which is clearly labelled because exchange prices and quote currencies can differ.")
+st.title("BTC Momentum-Level Historical Study")
+st.caption("Educational research + demo (paper) trading only • No real orders • No credentials for any exchange • Public market data")
+
+tab_study, tab_pnl, tab_act, tab_set = st.tabs(["📈 Study", "💰 Live P&L", "🧾 Trading activity", "⚙️ Settings"])
+
+# ================================================================= STUDY TAB
+with tab_study:
+    if not data_ok:
+        st.error(f"Could not load public data: {fetch_error}")
+        st.info("Check your connection. The app tried several public candle endpoints.")
+    else:
+        iv_td = pd.Timedelta(minutes=INTERVAL_MIN[interval])
+        directional = events[events["signal_side"] != 0] if not events.empty else events
+        now_utc = pd.Timestamp.now(tz="UTC")
+        win_open = in_trade_window(now_utc)
+        if not directional.empty:
+            last = directional.iloc[-1]
+            ago = int((closed["open_time"].iloc[-1] - last["event_time"]) / iv_td)
+            label = SIDE_LABEL[int(last["signal_side"])]
+            when = last["event_time"].tz_convert(IST).strftime("%a %d %b %H:%M IST")
+            took = in_trade_window(last["event_close_time"])
+            msg = (f"**Latest signal: {label}** · {last['pattern'].replace(' (candidate)', '')} · "
+                   f"candle {when} · {ago} candle(s) ago · price {last['event_price']:,.2f} {quote_currency} · "
+                   f"{'inside' if took else 'outside'} the Tue–Thu 7–11pm IST trade window")
+            (st.success if ago <= 3 else st.info)(msg)
+        else:
+            st.info("No directional signal in the loaded sample yet.")
+        st.caption(f"Trade window right now: {'OPEN' if win_open else 'closed'} · signals are shown at any day/time; "
+                   "the demo trader only trades inside the window unless Test mode is on (Settings).")
+
+        latest = closed.iloc[-1]
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Last closed candle (IST)", latest["open_time"].tz_convert(IST).strftime("%Y-%m-%d %H:%M"))
+        m2.metric(f"Last closed close ({quote_currency})", f'{latest["close"]:,.2f}')
+        m3.metric("Candidate momentum levels", f"{len(levels)}")
+
+        if forming:
+            live = chart_df.iloc[-1]
+            st.info(
+                f"A candle is currently forming (shown on the chart, excluded from calculations). "
+                f"Open {live['open_time'].tz_convert(IST).strftime('%H:%M:%S IST')} · "
+                f"O {live['open']:,.2f} / H {live['high']:,.2f} / L {live['low']:,.2f} / "
+                f"latest {live['close']:,.2f} {quote_currency}. Provisional until the interval ends.")
+        st.caption(f"Active data source: {data_source} · Quote currency: {quote_currency} · "
+                   f"Candles loaded: {len(df)} · Auto-refresh: {'on (30s)' if auto_refresh else 'off'}")
+        if provider != "Auto (fallback chain)" and not data_source.startswith(provider.split()[0]):
+            st.info(f"Your chosen provider ({provider}) failed, so data comes from {data_source}.")
+        if quote_currency != "USDT":
+            st.warning("USD fallback data is being displayed. The demo trader pauses on USD data unless you allow it in Settings.")
+        if provider_errors:
+            with st.expander("API fallback diagnostics"):
+                for item in provider_errors:
+                    st.text(item)
+
+        st.subheader("Historical price and candidate momentum-origin levels (IST)")
+        x_all = ist_naive(chart_df["open_time"])
+        fig = go.Figure(data=[go.Candlestick(
+            x=x_all, open=chart_df["open"], high=chart_df["high"], low=chart_df["low"],
+            close=chart_df["close"], name=f"BTC/{quote_currency}")])
+        x_end = x_all.iloc[-1]
+        for n, lv in enumerate(levels, start=1):
+            x0 = lv["time"].tz_convert(IST).tz_localize(None)
+            inv = bool(lv.get("invalidated"))
+            fig.add_shape(type="line", x0=x0, x1=x_end, y0=lv["price"], y1=lv["price"],
+                          line=dict(dash="dot", width=1, color="rgba(120,120,120,%s)" % (0.35 if inv else 0.8)))
+            if not compact:
+                fig.add_annotation(x=x_end, y=lv["price"], xanchor="left", showarrow=False, font=dict(size=9),
+                                   text=f"L{n} {lv['direction']}" + (" • invalidated" if inv else ""))
+        if not events.empty:
+            style = {1: ("#16a34a", "triangle-up"), -1: ("#dc2626", "triangle-down"), 0: ("#9ca3af", "circle")}
+            for pat, grp in events.groupby("pattern"):
+                col, sym = style[int(grp["signal_side"].iloc[0])]
+                fig.add_trace(go.Scatter(
+                    x=ist_naive(grp["event_time"]), y=grp["event_price"], mode="markers",
+                    marker=dict(size=9, color=col, symbol=sym), name=pat,
+                    hovertemplate="%{x}<br>Price: %{y:.2f}<br>" + pat + "<extra></extra>"))
+        fig.update_layout(height=380 if compact else 650, xaxis_rangeslider_visible=False,
+                          xaxis_title="Time (IST)", yaxis_title=f"Price ({quote_currency})",
+                          legend_orientation="h", margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(fig, width="stretch")
+
+        st.subheader("Method definition used in this prototype")
+        LEGACY_LINES = """- **Event rules: Legacy (first version).** A level is checked only on candles that touch it. Rejection patterns are checked before breaks. A strong break needs the candle to open on one side of the level and close on the other, with a big body near its edge, and ends the level. Cooldown applies after every event. No de-duplication across levels."""
+        IMPROVED_LINES = """- **Event rules: Improved.** Strong break is checked before rejection patterns. A level also ends after N consecutive closes beyond it, checked on every candle (touch or not). One event per candle: if several levels fire together, the defined pattern / most recent level is kept."""
+        st.markdown("""
+- **Impulse candle:** body ≥ the selected multiple of ATR. **Momentum origin:** the impulse candle's open (placeholder definition).
+- **Nearby-level filter:** a candidate is kept only if it is at least the selected ATR distance from existing levels.
+- **Rejection:** wick/body ratio, candle direction and close location meet the thresholds.
+{RULE_LINES}
+- **Direction-adjusted columns:** `fwd_return_dir_pct`, `favorable_excursion_pct`, `adverse_excursion_pct` flip the sign for SELL signals. The raw `future_*` columns are kept as-is.
+- **`trade` column:** BUY/SELL if the signal falls inside Tue–Thu 7–11pm IST, otherwise "signal only". `future_*` columns are measured after the signal, so they are analysis only, never an entry condition.
+""".replace("{RULE_LINES}", LEGACY_LINES if legacy else IMPROVED_LINES))
+
+        st.subheader("Historical event study (IST)")
+        if events.empty:
+            st.warning("No level-touch events met the current definitions in this sample.")
+        else:
+            v = events.copy()
+            v["in_trade_window"] = v["event_close_time"].apply(in_trade_window)
+            side_lbl = v["signal_side"].map(SIDE_LABEL)
+            v["trade"] = np.where(v["signal_side"] == 0, "", np.where(v["in_trade_window"], side_lbl, "signal only"))
+            order = st.radio("Order", ["By level, then time (as in the first version)", "Newest first"],
+                             horizontal=True)
+            v = (v.sort_values(["level_id", "event_time"]) if order.startswith("By level")
+                 else v.sort_values("event_time", ascending=False))
+            v["level_time"] = v["level_time"].dt.tz_convert(IST).astype(str)      # e.g. 2026-11-06 11:00:00+05:30
+            v["event_time"] = v["event_time"].dt.tz_convert(IST).astype(str)
+            cols = ["level_id", "level_time", "level_price", "origin_direction", "event_time", "event_price",
+                    "pattern", "forward_close_change_pct", "future_high_excursion_pct",
+                    "future_low_excursion_pct", "level_invalidated",
+                    "trade", "in_trade_window", "signal_side", "fwd_return_dir_pct",
+                    "favorable_excursion_pct", "adverse_excursion_pct"]
+            view = v[cols].round(5)
+            show_df(view)
+            st.download_button("Download event-study CSV (IST)", data=view.to_csv(index=False).encode("utf-8"),
+                               file_name="btc_momentum_level_events_ist.csv", mime="text/csv")
+            st.subheader("Descriptive outcomes by observed pattern")
+            show_df(signals.summarize(events).round(4),
+                    ["pattern", "events", "avg_dir_return_pct", "dir_win_rate_pct", "avg_future_high_excursion_pct"],
+                    compact)
+        st.warning("Research prototype. Outcomes are descriptive, exclude fees/slippage/funding, and do not prove an edge. "
+                   "Fallbacks may switch from BTC/USDT to BTC/USD, which is labelled.")
+
+# ================================================================= LIVE P&L TAB
+state, state_err = read_key("state")
+state = state or engine.new_state(S)
+price_for_pnl = live_price if live_price else state.get("last_price")
+
+with tab_pnl:
+    if state_err:
+        st.error(f"Storage read problem: {state_err}")
+    st.caption(f"Storage: {STORE.backend()}" + (" — ⚠️ data is lost on restart; connect Upstash in Settings"
+               if not storemod.get_creds()[0] else ""))
+    now_utc = pd.Timestamp.now(tz="UTC")
+    if in_trade_window(now_utc):
+        st.success("Trade window OPEN (Tue/Wed/Thu 7–11pm IST)")
+    else:
+        nxt = next_window_start(now_utc)
+        st.info("Trade window closed" + (f" · next opens {nxt.strftime('%a %d %b %H:%M IST')}" if nxt is not None else ""))
+    st.caption(f"Test mode: {'ON — signals outside the window are also traded and tagged TEST' if S['test_mode'] else 'OFF — window trades only'}"
+               f" · last worker run: {state.get('last_run_utc') or 'never'} · data: {state.get('last_source') or '-'}")
+    if state.get("last_error"):
+        st.warning(f"Worker's last error: {state['last_error']}")
+    st.subheader("Test controls")
+    tc1, tc2 = st.columns(2)
+    if S["test_mode"]:
+        if tc1.button("⏹ Stop test mode (enforce the window)"):
+            try:
+                set_settings(test_mode=False)
+                st.rerun()
+            except Exception as exc:                            # noqa: BLE001
+                st.error(f"Could not save: {type(exc).__name__}")
+    else:
+        if tc1.button("▶ Start test mode (bypass the window)", type="primary"):
+            try:
+                set_settings(test_mode=True)
+                st.rerun()
+            except Exception as exc:                            # noqa: BLE001
+                st.error(f"Could not save: {type(exc).__name__}")
+    if tc2.button("➕ Test trade now (follows the current signal)"):
+        now_t = pd.Timestamp.now(tz="UTC")
+        in_win_now = in_trade_window(now_t)
+        dsig = events[events["signal_side"] != 0] if (data_ok and not events.empty) else pd.DataFrame()
+        if not data_ok or live_price is None:
+            st.error("No live data available right now.")
+        elif not (in_win_now or S["test_mode"]):
+            st.warning("Outside the Tue–Thu 7–11pm IST window and test mode is stopped. "
+                       "Press 'Start test mode' first to force a test trade.")
+        elif dsig.empty:
+            st.warning("There is no directional signal in the loaded sample to follow.")
+        else:
+            last = dsig.iloc[-1]
+            side = int(last["signal_side"])
+            level_iso = last["level_time"].isoformat()
+            try:
+                fresh = STORE.read("state") or engine.new_state(S)          # uncached: latest account state
+                why = engine.block_reason(fresh, S, last["origin_direction"], bool(last["level_invalidated"]),
+                                          level_iso, quote_currency)
+                if why:
+                    st.warning(f"Blocked by your trader rules: {why}. (Only the timing window is bypassed in a test.)")
+                else:
+                    item = engine.build_trade(
+                        fresh["next_id"], S, side, last["pattern"], last["origin_direction"],
+                        bool(last["level_invalidated"]), level_iso, last["level_price"],
+                        chart_df["open_time"].iloc[-1].isoformat(), now_t.isoformat(), live_price,
+                        data_source, "WINDOW" if in_win_now else "TEST", "manual")
+                    fresh["next_id"] += 1
+                    fresh["trades"].append(item)
+                    fresh["signals"].append({
+                        "event_time": last["event_time"].isoformat(), "pattern": last["pattern"],
+                        "side": SIDE_LABEL[side], "price": float(live_price),
+                        "origin_direction": last["origin_direction"], "level_invalidated": bool(last["level_invalidated"]),
+                        "in_trade_window": bool(in_win_now), "source": data_source, "action": "TRADED (manual test)"})
+                    STORE.write("state", fresh)
+                    read_key.clear()
+                    state = fresh
+                    ago = int((closed["open_time"].iloc[-1] - last["event_time"]) / pd.Timedelta(minutes=INTERVAL_MIN[interval]))
+                    st.success(f"Placed {item['mode']} {SIDE_LABEL[side]} at {live_price:,.2f} following the "
+                               f"{last['pattern'].replace(' (candidate)', '')} signal from {ago} candle(s) ago.")
+            except Exception as exc:                                        # noqa: BLE001
+                st.error(f"Could not place the test trade: {type(exc).__name__}")
+    st.caption("A test trade is placed instantly when the window is open or test mode is started. It uses your Demo "
+               "trader settings (lot, TP/SL, fee, filters, max open trades).")
+    mode = st.radio("Show", ["All", "WINDOW", "TEST"], horizontal=True)
+    sm = engine.account_summary(state, mode, price_for_pnl)
+    a1, a2, a3 = st.columns(3)
+    a1.metric("Equity (USD)", f"{sm['equity']:,.2f}", f"{sm['equity'] - sm['initial']:+,.4f}")
+    a2.metric("Balance (realized)", f"{sm['balance']:,.2f}")
+    a3.metric("Unrealized P&L", f"{sm['unrealized']:+,.4f}")
+    b1, b2, b3 = st.columns(3)
+    b1.metric("Open / closed trades", f"{sm['open']} / {sm['closed']}")
+    b2.metric("Win rate", "-" if sm["win_rate"] is None else f"{sm['win_rate']:.0f}%")
+    b3.metric("Realized P&L", f"{sm['realized']:+,.4f}")
+    curve = sm["curve"]
+    cfig = go.Figure()
+    if len(curve):
+        xs = [ist_naive(curve["time"]).iloc[0] - pd.Timedelta(minutes=5)] + list(ist_naive(curve["time"]))
+        ys = [sm["initial"]] + list(curve["balance"])
+        cfig.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", line_shape="hv", name="Balance"))
+    cfig.update_layout(height=260 if compact else 340, yaxis_title="Balance (USD)", xaxis_title="Time (IST)",
+                       margin=dict(l=10, r=10, t=20, b=10))
+    st.plotly_chart(cfig, width="stretch")
+    td = engine.trades_df(state, mode)
+    st.subheader("Open positions")
+    opened = td[td["status"] == "OPEN"].copy() if not td.empty else td
+    if opened is None or len(opened) == 0:
+        st.caption("No open positions.")
+    else:
+        if price_for_pnl:
+            opened["unrealized_usd"] = opened["qty"] * (price_for_pnl - opened["entry_price"]) * opened["side_num"]
+        opened["entry_ist"] = ist_str(opened["entry_time"])
+        show_df(opened[["id", "mode", "side", "pattern", "entry_ist", "entry_price", "tp", "sl", "unrealized_usd"]].round(4),
+                ["id", "side", "entry_price", "unrealized_usd"], compact)
+
+# ================================================================= ACTIVITY TAB
+with tab_act:
+    st.subheader("Trades")
+    td = engine.trades_df(state, "All")
+    if td.empty:
+        st.caption("No trades yet. Trades appear here once the worker sees a signal "
+                   "(inside the window, or anytime with Test mode on).")
+    else:
+        td = td.sort_values("entry_time", ascending=False).copy()
+        td["entry_ist"] = ist_str(td["entry_time"])
+        td["exit_ist"] = ist_str(td["exit_time"]).fillna("") if td["exit_time"].notna().any() else ""
+        cols = ["id", "mode", "trigger", "status", "side", "pattern", "origin_direction", "level_invalidated", "entry_ist",
+                "entry_price", "exit_ist", "exit_price", "exit_reason", "bars_held", "pnl_usd",
+                "future_high_excursion_pct", "source"]
+        out = td[[c for c in cols if c in td.columns]].round(4)
+        show_df(out, ["id", "mode", "side", "entry_ist", "exit_reason", "pnl_usd", "future_high_excursion_pct"], compact)
+        st.download_button("Download trades CSV (IST)", data=out.to_csv(index=False).encode("utf-8"),
+                           file_name="paper_trades_ist.csv", mime="text/csv")
+    st.subheader("Recent signals seen by the trader")
+    sg = pd.DataFrame(state.get("signals", []))
+    if sg.empty:
+        st.caption("No signals recorded by the worker yet.")
+    else:
+        sg["event_time"] = pd.to_datetime(sg["event_time"], utc=True, format="ISO8601")
+        sg["time_ist"] = ist_str(sg["event_time"])
+        sg = sg.sort_values("event_time", ascending=False)
+        show_df(sg[["time_ist", "side", "pattern", "price", "origin_direction", "level_invalidated",
+                    "in_trade_window", "action"]].round(4), ["time_ist", "side", "in_trade_window", "action"], compact)
+
+# ================================================================= SETTINGS TAB
+with tab_set:
+    st.subheader("Storage connection (Upstash Redis)")
+    url_now, _, origin = storemod.get_creds()
+    st.caption({"env": "Connected via environment variables (permanent).",
+                "saved": "Connected via credentials saved on this server (lost if the server is rebuilt — "
+                         "use environment variables to make it permanent).",
+                None: "Not connected: using a local file (lost on restart on free hosting)."}[origin])
+    with st.form("conn"):
+        up_url = st.text_input("Upstash REST URL", placeholder="https://xxxx.upstash.io")
+        up_token = st.text_input("Upstash REST token", type="password")
+        go_save = st.form_submit_button("Save & test connection")
+    if go_save:
+        if not up_url or not up_token:
+            st.error("Enter both the REST URL and the token.")
+        else:
+            try:
+                storemod.test_connection(up_url, up_token)
+                storemod.save_creds(up_url, up_token)
+                read_key.clear()
+                st.success("Connected and saved. The background trader will use it on its next cycle. "
+                           "For permanence also add them as UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN on your host.")
+            except Exception as exc:                            # noqa: BLE001
+                st.error(f"Connection failed: {type(exc).__name__}. Check the URL and token.")
+    if origin == "saved" and st.button("Remove saved connection"):
+        storemod.clear_creds()
+        read_key.clear()
+        st.rerun()
+    st.caption("Tokens are never shown or logged. No exchange or trading credentials are ever needed — market data is public.")
+
+    st.subheader("Demo trader settings")
+    with st.form("trade_settings"):
+        c1, c2 = st.columns(2)
+        lot_usd = c1.number_input("Lot size (USD notional per trade)", 1.0, 100000.0, float(S["lot_usd"]), 1.0)
+        initial_balance = c2.number_input("Initial balance (USD, applies on account reset)", 100.0, 10_000_000.0,
+                                          float(S["initial_balance"]), 100.0)
+        tp_pct = c1.number_input("Take-profit (%)", 0.05, 10.0, float(S["tp_pct"]), 0.05)
+        sl_pct = c2.number_input("Stop-loss (%)", 0.05, 10.0, float(S["sl_pct"]), 0.05)
+        fee_pct = c1.number_input("Fee per side (%) — simulated", 0.0, 1.0, float(S["fee_pct"]), 0.01)
+        max_open = c2.number_input("Max open trades", 1, 20, int(S["max_open"]), 1)
+        st.caption("Test mode start/stop is on the Live P&L tab.")
+        origins = ["Both", "Bullish", "Bearish"]
+        allowed_origins = st.selectbox("Only trade levels with origin direction", origins,
+                                       index=origins.index(S["allowed_origins"]))
+        skip_inv = st.checkbox("Skip events that invalidate their level (breakout events)",
+                               value=bool(S["skip_invalidated_events"]))
+        allow_usd = st.checkbox("Allow trading on USD fallback data (Coinbase/Kraken)",
+                                value=bool(S["allow_usd_fallback"]))
+        use_sidebar = st.checkbox("Also save the current sidebar study settings for the trader", value=True)
+        saved = st.form_submit_button("Save settings")
+    if saved:
+        new = dict(S, lot_usd=lot_usd, initial_balance=initial_balance, tp_pct=tp_pct, sl_pct=sl_pct,
+                   fee_pct=fee_pct, max_open=int(max_open), allowed_origins=allowed_origins,
+                   skip_invalidated_events=skip_inv, allow_usd_fallback=allow_usd)
+        if use_sidebar:
+            new.update(study_values)
+        try:
+            STORE.write("settings", new)
+            read_key.clear()
+            st.success("Settings saved.")
+        except Exception as exc:                                # noqa: BLE001
+            st.error(f"Could not save settings: {type(exc).__name__}")
+    st.caption(f"Trader currently uses: {S['interval']} candles · impulse ≥ {S['impulse_atr']}×ATR · "
+               f"provider {S['provider']} · horizon {S['forward_bars']} bars · TP/SL {S['tp_pct']}% / {S['sl_pct']}% · lot ${S['lot_usd']:,.0f}")
+
+    with st.expander("Reset demo account"):
+        sure = st.checkbox("I understand this deletes all trades and restarts from the initial balance")
+        if st.button("Reset account", disabled=not sure):
+            try:
+                STORE.write("state", engine.new_state(S))
+                read_key.clear()
+                st.success("Account reset.")
+            except Exception as exc:                            # noqa: BLE001
+                st.error(f"Reset failed: {type(exc).__name__}")
+    st.caption("App login password: set APP_PASSWORD as an environment variable on your host (it is intentionally not a page field).")

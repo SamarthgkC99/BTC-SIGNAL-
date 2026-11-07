@@ -1,86 +1,48 @@
-BTC/USDT Momentum-Level Historical Study
-=========================================
+BTC Momentum-Level Study + Demo (paper) Trader
+==============================================
+Simulation only. No real orders, no exchange accounts, no trading credentials.
 
-Purpose
--------
-A non-executing educational Streamlit app to inspect BTC/USDT historical 5-minute
-candles, identify candidate momentum-origin levels, and describe what happened
-after price first returned to a level.
+Files
+  main.py       Render entry point: starts the dashboard, the background trader and a keep-alive pinger
+  app.py        Streamlit page: Study | Live P&L | Trading activity | Settings
+  signals.py    Signal engine (your original logic + the fixes)
+  engine.py     Paper-trading rules, P&L, summaries
+  providers.py  Public candle APIs: Binance -> Bybit -> OKX -> KuCoin -> (Coinbase, Kraken = USD)
+  store.py      Upstash Redis (REST) or local JSON-file fallback
+  render.yaml   Render blueprint (free plan, Singapore region)
 
-Data
-----
-The app tries public candle providers in this order:
-1. Binance Spot BTC/USDT host fallback chain (`data-api.binance.vision`, `api.binance.com`,
-   `api-gcp.binance.com`, and `api1` through `api4.binance.com`).
-2. Coinbase Exchange public BTC-USD candles.
-3. Kraken public BTC/USD OHLC.
+Trading rules (all editable in Settings)
+  BUY on bullish patterns, SELL (short) on bearish patterns; plain touches skipped.
+  Window: Tue/Wed/Thu 19:00-23:00 IST, judged by the signal candle's close time.
+  Test mode (default ON): signals outside the window are also traded and tagged TEST.
+  Lot $20 notional, initial balance $5,000, TP 0.5% / SL 0.5%, time exit after the
+  forward horizon (default 6 candles). If TP and SL are both inside one candle, SL is assumed.
+  Entry = signal candle close. Fees default 0 (simulated setting).
+  future_high_excursion_pct is measured AFTER the signal, so it is analysis only,
+  never an entry condition.
 
-Binance market-data-only documentation:
-https://github.com/binance/binance-spot-api-docs/blob/master/faqs/market_data_only.md
-Coinbase candles documentation:
-https://api.exchange.coinbase.com/products/BTC-USD/candles
-Kraken OHLC documentation:
-https://docs.kraken.com/api/docs/rest-api/get-ohlc-data/
+Test controls (Live P&L tab)
+  Start/Stop test mode: bypasses ONLY the Tue-Thu 7-11pm IST window (trades tagged TEST).
+  Test trade now: places ONE trade instantly in the direction of the latest signal at the live price,
+  when the trade window is open or test mode has been started. It follows every trader rule (lot,
+  TP/SL, fee, origin filter, skip-invalidated filter, max open trades, one open trade per level,
+  USD-data rule). Outside the window with test mode stopped, it asks you to start test mode first.
 
-No API key is needed. The app displays which provider succeeded and the quote
-currency. Coinbase/Kraken fallback data is BTC/USD, not BTC/USDT, so the currency
-is labelled honestly and prices may differ slightly between exchanges. The app
-does not connect to an account, request credentials, or place orders.
+Price provider (sidebar)
+  Auto chain, or choose Binance / Bybit / OKX / KuCoin / Coinbase (USD) / Kraken (USD).
+  A named provider is tried first; tick "fall back" to let the others take over if it fails.
+  'Apply these study settings + provider to the trader' saves them for the background worker.
 
-The app can auto-refresh every 30 seconds. It shows the in-progress candle on
-the chart as provisional, but excludes that candle from the historical calculations
-until the candle interval has closed. A manual refresh button is also available.
+Event rules (sidebar)
+  Legacy (first version, default, cooldown 3) or Improved (stricter invalidation, one event per candle).
 
-Important provisional assumptions
----------------------------------
-1. "Impulse" is approximated as candle body >= selected ATR multiple.
-2. "Impulse origin" is provisionally the impulse candle's open.
-3. Nearby levels are filtered using a configurable minimum ATR spacing.
-4. Rejection candles use configurable wick/body and close-location conditions.
-5. Breakout candidates require a strong body, a close beyond the level, and a
-   close near the candle edge.
-6. After each touch, the app records forward price movement over a chosen horizon.
-   This is not a trading return and does not prove profitability.
+Environment variables (set on Render, never in code)
+  APP_PASSWORD               login password for the page
+  UPSTASH_REDIS_REST_URL     from the Upstash console (REST API section)
+  UPSTASH_REDIS_REST_TOKEN   from the Upstash console
 
-These definitions are starting assumptions because "origin of a momentum move"
-and the user's custom nearby-level filter still need exact definitions.
-
-Behaviour of levels over time
------------------------------
-A level is not frozen after its first touch:
-
-- The same level can fire repeated events. After an event the level rests for
-  the selected cooldown bars, then continues to be watched.
-- A level is invalidated once price strongly closes beyond it. Invalidated
-  levels stop producing events and their chart label is marked invalidated, so
-  a bearish-origin level that is broken upward stops dominating the study.
-- Forward movement is only measured when the full horizon of bars exists, so
-  events near the newest candles are not mixed in as if they covered the whole
-  window.
-
-Earlier versions scanned each level only until its first touch (a permanent
-break), which made the first observed pattern stick permanently even after the
-market flipped. That behaviour is fixed.
-
-Run on Windows 11
------------------
-1. Open Command Prompt in this folder.
-2. Create/activate a virtual environment if desired:
-     python -m venv .venv
-     .venv\Scripts\activate
-3. Install requirements:
-     python -m pip install -r requirements.txt
-4. Run:
-     streamlit run app.py
-
-If your current project already has an active virtual environment, install the
-requirements there. No API key is needed for this public market-data endpoint.
-
-Safety and limitations
-----------------------
-- Historical study only; no buy/sell recommendations or order execution.
-- Does not include fees, slippage, funding, or realistic fill simulation.
-- A current, unfinished candle is shown as provisional but excluded from calculations.
-- A successful HTTP response does not independently authenticate the quality of
-  a market-data provider.
-- Do not add account or trading credentials to this project.
+Run locally (Windows 11)
+  python -m venv .venv
+  .venv\Scripts\activate
+  python -m pip install -r requirements.txt
+  python main.py            (trader + dashboard)   or   streamlit run app.py   (dashboard only)
